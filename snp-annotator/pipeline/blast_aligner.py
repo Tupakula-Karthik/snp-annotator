@@ -1,47 +1,88 @@
 """
-blast_aligner.py
+blast_aligner.py — uses NCBI BLAST REST API instead of BioPython qblast
 """
 
 import time
 import re
-from Bio.Blast import NCBIWWW, NCBIXML
+import json
+import urllib.request
+import urllib.parse
 
-BLAST_PROGRAM  = "blastn"
-BLAST_DATABASE = "nt"
-MEGABLAST      = True
-ENTREZ_QUERY   = 'Homo sapiens[Organism]'
+BLAST_URL = "https://blast.ncbi.nlm.nih.gov/blast/Blast.cgi"
 
 
 def run_blast(sequence: str) -> dict | None:
-    # Trim Ns from ends
     sequence = sequence.strip("N")
     if len(sequence) < 100:
-        raise ValueError("Sequence too short for reliable BLAST alignment (need 100+ bp)")
+        raise ValueError("Sequence too short (need 100+ bp)")
 
-    # Try up to 2 times
-    result_handle = None
-    for attempt in range(2):
-        try:
-            result_handle = NCBIWWW.qblast(
-                program=BLAST_PROGRAM,
-                database=BLAST_DATABASE,
-                sequence=sequence,
-                megablast=MEGABLAST,
-                entrez_query=ENTREZ_QUERY,
-                hitlist_size=5,
-                alignments=5,
-                descriptions=5,
-            )
-            break
-        except Exception as e:
-            if attempt == 1:
-                raise ValueError(f"BLAST failed after 2 attempts: {e}")
-            time.sleep(10)
+    # Step 1 — Submit job
+    rid = _submit_blast(sequence)
+    if not rid:
+        raise ValueError("Failed to submit BLAST job")
 
-    if result_handle is None:
+    # Step 2 — Poll until done
+    results_xml = _poll_blast(rid)
+    if not results_xml:
+        raise ValueError("BLAST timed out or returned no results")
+
+    # Step 3 — Parse XML
+    return _parse_blast_xml(results_xml)
+
+
+def _submit_blast(sequence: str) -> str | None:
+    params = urllib.parse.urlencode({
+        "CMD":        "Put",
+        "PROGRAM":    "blastn",
+        "DATABASE":   "nt",
+        "QUERY":      sequence,
+        "MEGABLAST":  "on",
+        "ENTREZ_QUERY": "Homo sapiens[Organism]",
+        "HITLIST_SIZE": "5",
+        "FORMAT_TYPE":  "XML",
+    }).encode()
+
+    req = urllib.request.Request(BLAST_URL, data=params)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        html = resp.read().decode()
+
+    m = re.search(r'RID = (\w+)', html)
+    return m.group(1) if m else None
+
+
+def _poll_blast(rid: str, max_wait: int = 180) -> str | None:
+    params = urllib.parse.urlencode({
+        "CMD":         "Get",
+        "RID":         rid,
+        "FORMAT_TYPE": "XML",
+    })
+    url = f"{BLAST_URL}?{params}"
+
+    for _ in range(max_wait // 10):
+        time.sleep(10)
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode()
+
+        if "Status=WAITING" in content:
+            continue
+        if "Status=FAILED" in content:
+            return None
+        if "Status=READY" in content or "<BlastOutput>" in content:
+            return content
+
+    return None
+
+
+def _parse_blast_xml(xml_text: str) -> dict | None:
+    from io import StringIO
+    from Bio.Blast import NCBIXML
+
+    try:
+        blast_records = list(NCBIXML.parse(StringIO(xml_text)))
+    except Exception:
         return None
 
-    blast_records = list(NCBIXML.parse(result_handle))
     if not blast_records or not blast_records[0].alignments:
         return None
 
@@ -58,7 +99,7 @@ def run_blast(sequence: str) -> dict | None:
     raw_mismatches, mismatch_count = _extract_mismatches(hsp, sbjct_start, strand)
 
     return {
-        "chromosome":      chrom,
+        "chromosome":     chrom,
         "hsp": {
             "sbjct_start": sbjct_start,
             "sbjct_end":   sbjct_end,
@@ -70,22 +111,20 @@ def run_blast(sequence: str) -> dict | None:
             "identities":  hsp.identities,
             "gaps":        hsp.gaps,
         },
-        "strand":          strand,
-        "mismatches":      mismatch_count,
-        "raw_mismatches":  raw_mismatches,
-        "query_length":    blast_record.query_length,
-        "accession":       alignment.accession,
-        "hit_title":       alignment.title,
+        "strand":         strand,
+        "mismatches":     mismatch_count,
+        "raw_mismatches": raw_mismatches,
+        "query_length":   blast_record.query_length,
+        "accession":      alignment.accession,
+        "hit_title":      alignment.title,
     }
 
 
 def _extract_chromosome(title: str) -> str:
-    # Try explicit chromosome mention first
     m = re.search(r'chromosome\s+(\d+|X|Y|MT|M)\b', title, re.IGNORECASE)
     if m:
         return m.group(1).upper()
 
-    # Try NC_ accession — NC_000001=chr1 ... NC_000022=chr22, NC_000023=X, NC_000024=Y
     m = re.search(r'NC_(\d+)\.\d+', title)
     if m:
         acc_num = int(m.group(1))
@@ -97,11 +136,6 @@ def _extract_chromosome(title: str) -> str:
             return "Y"
         if acc_num == 12920:
             return "MT"
-
-    # Try NT_ or NW_ (unplaced scaffolds) — return accession as fallback
-    m = re.search(r'(NT_|NW_)\d+', title)
-    if m:
-        return "unplaced"
 
     return "?"
 
