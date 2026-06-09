@@ -74,10 +74,7 @@ def _esearch_snp(chrom: str, position: int) -> str | None:
 
 
 def _fetch_snp_via_api(rs_id: str) -> dict:
-    """
-    Use NCBI Variation Services REST API — more reliable than eSummary
-    for getting gene, consequence, and clinical significance.
-    """
+    """Use NCBI Variation Services REST API — more reliable than eSummary."""
     numeric_id = rs_id.lstrip("rs")
     url = f"https://api.ncbi.nlm.nih.gov/variation/v0/beta/refsnp/{numeric_id}"
 
@@ -85,22 +82,18 @@ def _fetch_snp_via_api(rs_id: str) -> dict:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
+        return _parse_variation_api(data)
     except Exception:
-        # Fall back to eSummary if REST API fails
         return _esummary_snp(rs_id)
-
-    return _parse_variation_api(data)
 
 
 def _parse_variation_api(data: dict) -> dict:
-    """Parse NCBI Variation Services API response."""
     result = {
         "gene":                  None,
         "consequence":           None,
         "clinical_significance": None,
     }
 
-    # Gene name from primary_snapshot_data
     try:
         allele_annotations = (
             data.get("primary_snapshot_data", {})
@@ -116,8 +109,7 @@ def _parse_variation_api(data: dict) -> dict:
                     if name:
                         genes.add(name)
                     for rna in gene.get("rnas", []):
-                        conseq = rna.get("sequence_ontology", [])
-                        for c in conseq:
+                        for c in rna.get("sequence_ontology", []):
                             label = c.get("name", "")
                             if label:
                                 consequences.add(_humanise_consequence(label))
@@ -130,7 +122,6 @@ def _parse_variation_api(data: dict) -> dict:
     except Exception:
         pass
 
-    # Clinical significance
     try:
         clin_sigs = set()
         support = (
@@ -152,7 +143,6 @@ def _parse_variation_api(data: dict) -> dict:
 
 
 def _esummary_snp(rs_id: str) -> dict:
-    """Fallback: eSummary parsing."""
     numeric_id = rs_id.lstrip("rs")
     handle = Entrez.esummary(db="snp", id=numeric_id)
     records = Entrez.read(handle)
@@ -217,23 +207,23 @@ def _normalise_chrom(chrom: str) -> str:
 
 def _humanise_consequence(raw: str) -> str:
     mapping = {
-        "missense":         "Missense variant",
-        "nonsense":         "Nonsense (stop-gain)",
-        "synonymous":       "Synonymous (silent)",
-        "frameshift":       "Frameshift",
-        "intron":           "Intronic",
-        "splice":           "Splice site",
-        "utr":              "UTR variant",
-        "downstream":       "Downstream gene variant",
-        "upstream":         "Upstream gene variant",
-        "intergenic":       "Intergenic",
-        "cds":              "Coding sequence variant",
-        "3prime_utr":       "3′ UTR variant",
-        "5prime_utr":       "5′ UTR variant",
-        "stop_gained":      "Nonsense (stop-gain)",
-        "stop_lost":        "Stop lost",
-        "start_lost":       "Start lost",
-        "nc_transcript":    "Non-coding transcript variant",
+        "missense":          "Missense variant",
+        "nonsense":          "Nonsense (stop-gain)",
+        "synonymous":        "Synonymous (silent)",
+        "frameshift":        "Frameshift",
+        "intron":            "Intronic",
+        "splice":            "Splice site",
+        "utr":               "UTR variant",
+        "downstream":        "Downstream gene variant",
+        "upstream":          "Upstream gene variant",
+        "intergenic":        "Intergenic",
+        "cds":               "Coding sequence variant",
+        "3prime_utr":        "3′ UTR variant",
+        "5prime_utr":        "5′ UTR variant",
+        "stop_gained":       "Nonsense (stop-gain)",
+        "stop_lost":         "Stop lost",
+        "start_lost":        "Start lost",
+        "nc_transcript":     "Non-coding transcript variant",
     }
     raw_lower = raw.lower()
     for key, label in mapping.items():
