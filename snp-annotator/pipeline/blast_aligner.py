@@ -13,16 +13,33 @@ ENTREZ_QUERY   = 'Homo sapiens[Organism]'
 
 
 def run_blast(sequence: str) -> dict | None:
-    result_handle = NCBIWWW.qblast(
-        program=BLAST_PROGRAM,
-        database=BLAST_DATABASE,
-        sequence=sequence,
-        megablast=MEGABLAST,
-        entrez_query=ENTREZ_QUERY,
-        hitlist_size=5,
-        alignments=5,
-        descriptions=5,
-    )
+    # Trim Ns from ends
+    sequence = sequence.strip("N")
+    if len(sequence) < 100:
+        raise ValueError("Sequence too short for reliable BLAST alignment (need 100+ bp)")
+
+    # Try up to 2 times
+    result_handle = None
+    for attempt in range(2):
+        try:
+            result_handle = NCBIWWW.qblast(
+                program=BLAST_PROGRAM,
+                database=BLAST_DATABASE,
+                sequence=sequence,
+                megablast=MEGABLAST,
+                entrez_query=ENTREZ_QUERY,
+                hitlist_size=5,
+                alignments=5,
+                descriptions=5,
+            )
+            break
+        except Exception as e:
+            if attempt == 1:
+                raise ValueError(f"BLAST failed after 2 attempts: {e}")
+            time.sleep(10)
+
+    if result_handle is None:
+        return None
 
     blast_records = list(NCBIXML.parse(result_handle))
     if not blast_records or not blast_records[0].alignments:
@@ -68,7 +85,7 @@ def _extract_chromosome(title: str) -> str:
     if m:
         return m.group(1).upper()
 
-    # Try NC_ accession number
+    # Try NC_ accession — NC_000001=chr1 ... NC_000022=chr22, NC_000023=X, NC_000024=Y
     m = re.search(r'NC_(\d+)\.\d+', title)
     if m:
         acc_num = int(m.group(1))
@@ -81,7 +98,12 @@ def _extract_chromosome(title: str) -> str:
         if acc_num == 12920:
             return "MT"
 
-    return title[:80]
+    # Try NT_ or NW_ (unplaced scaffolds) — return accession as fallback
+    m = re.search(r'(NT_|NW_)\d+', title)
+    if m:
+        return "unplaced"
+
+    return "?"
 
 
 def _extract_mismatches(hsp, sbjct_start: int, strand: int) -> tuple[list, int]:
