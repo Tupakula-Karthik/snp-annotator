@@ -81,7 +81,7 @@ def _extract_chromosome(title: str) -> str:
         if acc_num == 12920:
             return "MT"
 
-    return "?"
+    return title[:80]
 
 
 def _extract_mismatches(hsp, sbjct_start: int, strand: int) -> tuple[list, int]:
