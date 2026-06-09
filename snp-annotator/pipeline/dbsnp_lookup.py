@@ -1,41 +1,18 @@
 """
 dbsnp_lookup.py
-───────────────
-For each mismatch position from BLAST, queries NCBI Entrez/dbSNP to:
-  1. Find rs IDs at that genomic coordinate
-  2. Fetch variant details: gene, consequence, clinical significance
-
-Uses Entrez eSearch + eSummary — no API key required (anonymous, 3 req/sec).
 """
 
 import time
 import re
+import json
+import urllib.request
 from Bio import Entrez
 
-# NCBI requires an email for anonymous Entrez access
 Entrez.email = "snp-annotator-app@example.com"
-RATE_LIMIT_DELAY = 0.4   # seconds between requests (≤3/sec anonymous)
+RATE_LIMIT_DELAY = 0.4
 
 
 def lookup_dbsnp(blast_result: dict) -> list[dict]:
-    """
-    Parameters
-    ----------
-    blast_result : dict from blast_aligner.run_blast()
-
-    Returns
-    -------
-    list of variant dicts, one per mismatch:
-    {
-        position            : int
-        ref_base            : str
-        query_base          : str
-        rs_id               : str | None      e.g. "rs1801133"
-        gene                : str | None
-        consequence         : str | None
-        clinical_significance: str | None
-    }
-    """
     chrom      = blast_result.get("chromosome", "?")
     mismatches = blast_result.get("raw_mismatches", [])
 
@@ -50,13 +27,13 @@ def lookup_dbsnp(blast_result: dict) -> list[dict]:
 
         ann = _query_single_position(chrom, pos)
         variants.append({
-            "position":             pos,
-            "ref_base":             ref_base,
-            "query_base":           query_base,
-            "rs_id":                ann.get("rs_id"),
-            "gene":                 ann.get("gene"),
-            "consequence":          ann.get("consequence"),
-            "clinical_significance":ann.get("clinical_significance"),
+            "position":              pos,
+            "ref_base":              ref_base,
+            "query_base":            query_base,
+            "rs_id":                 ann.get("rs_id"),
+            "gene":                  ann.get("gene"),
+            "consequence":           ann.get("consequence"),
+            "clinical_significance": ann.get("clinical_significance"),
         })
         time.sleep(RATE_LIMIT_DELAY)
 
@@ -64,10 +41,6 @@ def lookup_dbsnp(blast_result: dict) -> list[dict]:
 
 
 def _query_single_position(chrom: str, position: int) -> dict:
-    """
-    Search dbSNP for an rs ID at the given chromosome:position.
-    Falls back gracefully at each step.
-    """
     try:
         rs_id = _esearch_snp(chrom, position)
     except Exception:
@@ -77,27 +50,19 @@ def _query_single_position(chrom: str, position: int) -> dict:
         return {}
 
     try:
-        details = _esummary_snp(rs_id)
+        details = _fetch_snp_via_api(rs_id)
     except Exception:
         details = {}
 
-    return {
-        "rs_id": rs_id,
-        **details,
-    }
+    return {"rs_id": rs_id, **details}
 
 
 def _esearch_snp(chrom: str, position: int) -> str | None:
-    """
-    Use Entrez eSearch on the SNP database to find variants at a coordinate.
-    Search term:  "chrN[CHR] AND pos[CHRPOS]"
-    """
-    # Normalise chromosome notation
     chrom_term = _normalise_chrom(chrom)
     term = f'{chrom_term}[CHR] AND {position}[CHRPOS]'
 
-    handle  = Entrez.esearch(db="snp", term=term, retmax=1)
-    record  = Entrez.read(handle)
+    handle = Entrez.esearch(db="snp", term=term, retmax=1)
+    record = Entrez.read(handle)
     handle.close()
     time.sleep(RATE_LIMIT_DELAY)
 
@@ -108,24 +73,98 @@ def _esearch_snp(chrom: str, position: int) -> str | None:
     return f"rs{ids[0]}"
 
 
+def _fetch_snp_via_api(rs_id: str) -> dict:
+    """
+    Use NCBI Variation Services REST API — more reliable than eSummary
+    for getting gene, consequence, and clinical significance.
+    """
+    numeric_id = rs_id.lstrip("rs")
+    url = f"https://api.ncbi.nlm.nih.gov/variation/v0/beta/refsnp/{numeric_id}"
+
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        # Fall back to eSummary if REST API fails
+        return _esummary_snp(rs_id)
+
+    return _parse_variation_api(data)
+
+
+def _parse_variation_api(data: dict) -> dict:
+    """Parse NCBI Variation Services API response."""
+    result = {
+        "gene":                  None,
+        "consequence":           None,
+        "clinical_significance": None,
+    }
+
+    # Gene name from primary_snapshot_data
+    try:
+        allele_annotations = (
+            data.get("primary_snapshot_data", {})
+                .get("allele_annotations", [])
+        )
+        genes = set()
+        consequences = set()
+
+        for allele in allele_annotations:
+            for ann in allele.get("assembly_annotation", []):
+                for gene in ann.get("genes", []):
+                    name = gene.get("name") or gene.get("locus")
+                    if name:
+                        genes.add(name)
+                    for rna in gene.get("rnas", []):
+                        conseq = rna.get("sequence_ontology", [])
+                        for c in conseq:
+                            label = c.get("name", "")
+                            if label:
+                                consequences.add(_humanise_consequence(label))
+
+        if genes:
+            result["gene"] = ", ".join(sorted(genes)[:2])
+        if consequences:
+            result["consequence"] = ", ".join(sorted(consequences)[:2])
+
+    except Exception:
+        pass
+
+    # Clinical significance
+    try:
+        clin_sigs = set()
+        support = (
+            data.get("primary_snapshot_data", {})
+                .get("support", [])
+        )
+        for s in support:
+            for interp in s.get("clinical_significances", []):
+                sig = interp.get("clinical_significance_type", "")
+                if sig:
+                    clin_sigs.add(_humanise_clinsig(sig))
+
+        if clin_sigs:
+            result["clinical_significance"] = ", ".join(sorted(clin_sigs))
+    except Exception:
+        pass
+
+    return result
+
+
 def _esummary_snp(rs_id: str) -> dict:
-    """
-    Fetch a DocSum for the given rs ID and extract key annotation fields.
-    """
+    """Fallback: eSummary parsing."""
     numeric_id = rs_id.lstrip("rs")
     handle = Entrez.esummary(db="snp", id=numeric_id)
     records = Entrez.read(handle)
     handle.close()
     time.sleep(RATE_LIMIT_DELAY)
 
-    # DocSum structure varies; try common paths
     doc = {}
     if isinstance(records, list) and records:
         doc = records[0]
     elif isinstance(records, dict):
         doc = records
 
-    # DocumentSummarySet path
     if "DocumentSummarySet" in doc:
         summaries = doc["DocumentSummarySet"].get("DocumentSummary", [])
         if summaries:
@@ -135,14 +174,12 @@ def _esummary_snp(rs_id: str) -> dict:
 
 
 def _parse_docsummary(doc: dict) -> dict:
-    """Extract gene, consequence, and clinical significance from a DocSum."""
     result = {
-        "gene":                 None,
-        "consequence":          None,
-        "clinical_significance":None,
+        "gene":                  None,
+        "consequence":           None,
+        "clinical_significance": None,
     }
 
-    # Gene name — various possible keys
     for key in ("GENES", "gene", "GENE_ID"):
         val = doc.get(key)
         if val:
@@ -157,14 +194,12 @@ def _parse_docsummary(doc: dict) -> dict:
                 result["gene"] = val.strip()[:30]
             break
 
-    # Functional consequence
     for key in ("FXN_CLASS", "fxn_class", "CONSEQUENCE"):
         val = doc.get(key)
         if val:
             result["consequence"] = _humanise_consequence(str(val))
             break
 
-    # Clinical significance (ClinVar-linked)
     for key in ("CLINICAL_SIGNIFICANCE", "clinical_significance", "CLINSIG"):
         val = doc.get(key)
         if val and str(val).strip() not in ("", "0", "unknown"):
@@ -175,14 +210,12 @@ def _parse_docsummary(doc: dict) -> dict:
 
 
 def _normalise_chrom(chrom: str) -> str:
-    """Convert various chromosome notations to the integer/letter form dbSNP expects."""
     chrom = str(chrom).upper().replace("CHR", "").strip()
     mapping = {"MT": "26", "M": "26", "X": "23", "Y": "24"}
     return mapping.get(chrom, chrom)
 
 
 def _humanise_consequence(raw: str) -> str:
-    """Map dbSNP FXN_CLASS codes to human-readable strings."""
     mapping = {
         "missense":         "Missense variant",
         "nonsense":         "Nonsense (stop-gain)",
@@ -197,6 +230,10 @@ def _humanise_consequence(raw: str) -> str:
         "cds":              "Coding sequence variant",
         "3prime_utr":       "3′ UTR variant",
         "5prime_utr":       "5′ UTR variant",
+        "stop_gained":      "Nonsense (stop-gain)",
+        "stop_lost":        "Stop lost",
+        "start_lost":       "Start lost",
+        "nc_transcript":    "Non-coding transcript variant",
     }
     raw_lower = raw.lower()
     for key, label in mapping.items():
@@ -206,12 +243,11 @@ def _humanise_consequence(raw: str) -> str:
 
 
 def _humanise_clinsig(raw: str) -> str:
-    """Normalise ClinVar clinical significance strings."""
     raw_lower = raw.lower()
-    if "pathogenic" in raw_lower and "likely" not in raw_lower:
-        return "Pathogenic"
     if "likely_pathogenic" in raw_lower or "likely pathogenic" in raw_lower:
         return "Likely pathogenic"
+    if "pathogenic" in raw_lower:
+        return "Pathogenic"
     if "likely_benign" in raw_lower or "likely benign" in raw_lower:
         return "Likely benign"
     if "benign" in raw_lower:
